@@ -72,6 +72,30 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 	return nil
 }
 
+// DisconnectUsers 强制断开一批用户当前已建立的所有连接，但不撤销其鉴权身份
+// （不调用 userManager.RemoveUser，不清理流量计数器），用户可以立即重新建立
+// 新连接。用于动态限速触发时，让已经建立好的连接（如正在下载的大文件、正在
+// 播放的视频流）也能感知到新的限速值——仅靠更新限速桶速率对已建立的连接
+// 不一定生效（部分协议路径会绕过限速写入点直接操作底层 socket），必须强制
+// 断开让客户端重新连接，新连接才会重新走一遍限速判断逻辑。
+func (vc *V2Core) DisconnectUsers(users []panel.UserInfo, tag string) error {
+	var user string
+	vc.users.mapLock.Lock()
+	defer vc.users.mapLock.Unlock()
+	for i := range users {
+		user = format.UserTag(tag, users[i].Uuid)
+		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
+			lm := v.(*dispatcher.LinkManager)
+			lm.CloseAll()
+			// 删除旧的（已 CloseAll 标记为 closed 的）LinkManager 记录，
+			// 保证该用户下一次重新建立连接时会创建一个全新的 LinkManager，
+			// 不会被历史的 closed 状态误伤（否则新连接会被立即强制关闭）。
+			vc.dispatcher.LinkManagers.Delete(user)
+		}
+	}
+	return nil
+}
+
 func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
 	trafficSlice := make([]panel.UserTraffic, 0)
 	vc.users.mapLock.RLock()

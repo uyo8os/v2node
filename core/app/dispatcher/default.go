@@ -200,14 +200,58 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		} else {
 			lm = lmloaded.(*LinkManager)
 		}
-		managedWriter := &ManagedWriter{
+		// 关键修复：注册该连接的原始 TCP/Unix socket（session.Inbound.Conn）。
+		// 这是唯一能保证"强制下线必定断开连接"的方式——不管 VLESS XTLS Vision
+		// 等协议内部如何通过 unsafe 指针直读/直写底层 conn 来绕过我们包装的
+		// pipe Reader/Writer，直接关闭这个原始 socket 都会在操作系统层面
+		// 中断该连接的所有读写，是操作系统级别的保证，不依赖协议内部实现细节。
+		conn := sessionInbound.Conn
+		if conn != nil {
+			lm.AddConn(conn)
+		}
+		// onCloseFn：连接正常结束时把该 socket 的引用计数减一。这里的一次
+		// AddConn 对应上下行两个方向（inboundLink.Writer / outboundLink.Writer）
+		// 各一个 ManagedWriter，正常情况下两个方向都会各自触发一次 Close()。
+		// 必须用 sync.Once 包裹，确保一次 AddConn 无论被多少个 Writer 的
+		// Close() 触发，RemoveConn 只真正执行一次——否则会对同一次 AddConn
+		// 多减一次引用计数。这在无 Mux 的单一物理连接场景下看似无害（因为
+		// RemoveConn 对已删除的 key 是安全空操作），但在 VLESS Mux 场景下
+		// （多个子流共享同一条物理连接，每个子流各自调用一次 AddConn 使计数
+		// 累加）会导致某个子流结束时错误地把其他子流仍在使用的连接引用计数
+		// 多减 1，可能造成该连接被过早移出追踪表，导致后续强制下线时漏关。
+		var onCloseFn func()
+		if conn != nil {
+			var once sync.Once
+			onCloseFn = func() { once.Do(func() { lm.RemoveConn(conn) }) }
+		}
+		// 上行管道（客户端 -> 目标）：写端交给 inbound 持有，读端由 outbound 持有
+		managedUpWriter := &ManagedWriter{
 			writer:  uplinkWriter,
 			manager: lm,
+			onClose: onCloseFn,
 		}
-		lm.AddLink(managedWriter, outboundLink.Reader)
-		inboundLink.Writer = managedWriter
+		lm.AddLink(managedUpWriter, outboundLink.Reader)
+		inboundLink.Writer = managedUpWriter
+		// 下行管道（目标 -> 客户端）：写端交给 outbound 持有，读端由 inbound 持有
+		// 必须同时纳管下行管道，否则强制踢用户时只会关闭"上行请求"通道，
+		// 已经在传输的下载/视频流（下行数据）不会被打断，导致用户被删除后
+		// 已建立的连接仍能持续消耗流量（不会断流）。
+		managedDownWriter := &ManagedWriter{
+			writer:  downlinkWriter,
+			manager: lm,
+			onClose: onCloseFn,
+		}
+		lm.AddLink(managedDownWriter, inboundLink.Reader)
+		outboundLink.Writer = managedDownWriter
+		// 强制禁止 splice 零拷贝优化（xray-core 在 freedom 出站等场景下会将
+		// 上下行数据在内核态 socket 之间直接搬运，完全绕过上面注册进 LinkManager
+		// 的 pipe Reader/Writer）。一旦发生 splice，CloseAll() 关闭的 pipe 对象
+		// 早已和真实数据流脱钩，导致强制下线时已建立的连接（如大文件下载、
+		// 视频流）无法被真正断开。这里必须无条件设置为 3（禁止），不能像官方
+		// xray-core 那样只在配置了速度限制时才设置，否则未限速用户的连接会
+        // 被 splice 绕过而无法被踢下线。
+		sessionInbound.CanSpliceCopy = 3
 		if w != nil {
-			sessionInbound.CanSpliceCopy = 3
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
 		}
@@ -382,13 +426,24 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		} else {
 			lm = lmloaded.(*LinkManager)
 		}
+		// 同 getLink()：注册原始 socket，保证强制下线时能在系统层面真正断开连接。
+		conn := sessionInbound.Conn
+		if conn != nil {
+			lm.AddConn(conn)
+		}
 		managedWriter := &ManagedWriter{
 			writer:  outbound.Writer,
 			manager: lm,
 		}
+		if conn != nil {
+			// 连接正常结束时清理 conns 表，避免内存泄漏（同 getLink()）。
+			managedWriter.onClose = func() { lm.RemoveConn(conn) }
+		}
 		outbound.Writer = managedWriter
+		// 同 getLink()：必须无条件禁止 splice，否则 CloseAll() 无法真正断开
+		// 未限速用户的已建立连接（splice 会绕过这里注册的 pipe 对象）。
+		sessionInbound.CanSpliceCopy = 3
 		if w != nil {
-			sessionInbound.CanSpliceCopy = 3
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
 		}
 		var t *counter.TrafficCounter

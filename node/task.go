@@ -141,6 +141,27 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		// update Limiter
 		c.limiter.UpdateUser(c.tag, added, deleted, modified)
 	}
+
+	// 扫描面板下发的一次性强制断连信号（动态限速规则勾选了"打断已有连接"时触发），
+	// 强制断开这些用户在本节点的所有已建立连接，让其重新连接后走新的限速值。
+	// 这一步与上面的 added/deleted/modified 逻辑完全独立，不影响用户的鉴权状态。
+	var kicked []panel.UserInfo
+	for i := range newU {
+		if newU[i].Kick {
+			kicked = append(kicked, newU[i])
+		}
+	}
+	if len(kicked) > 0 {
+		if err := c.server.DisconnectUsers(kicked, c.tag); err != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": err,
+			}).Error("Disconnect users failed")
+		} else {
+			log.WithField("tag", c.tag).Infof("Force disconnected %d users by dynamic speed limit rule", len(kicked))
+		}
+	}
+
 	c.userList = newU
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil

@@ -22,6 +22,10 @@ type UserInfo struct {
 	Uuid        string `json:"uuid" msgpack:"uuid"`
 	SpeedLimit  int    `json:"speed_limit" msgpack:"speed_limit"`
 	DeviceLimit int    `json:"device_limit" msgpack:"device_limit"`
+	// Kick 为一次性信号：面板检测到该用户在本节点触发了"打断已有连接"的动态限速
+	// 规则时置为 true，节点收到后应强制断开该用户当前所有连接（不撤销鉴权身份），
+	// 面板在被节点拉取到这一次之后会自动清除该信号，不会重复下发。
+	Kick bool `json:"kick,omitempty" msgpack:"kick,omitempty"`
 }
 
 type UserListBody struct {
