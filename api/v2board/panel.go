@@ -20,7 +20,6 @@ type Client struct {
 	Token            string
 	NodeId           int
 	nodeEtag         string
-	userEtag         string
 	responseBodyHash string
 	UserList         *UserListBody
 	AliveMap         *AliveMap

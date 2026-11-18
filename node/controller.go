@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
@@ -19,6 +20,8 @@ type Controller struct {
 	tag                     string
 	limiter                 *limiter.Limiter
 	userList                []panel.UserInfo
+	userListETag            string
+	userSyncMu              sync.Mutex
 	aliveMap                map[int]int
 	conf                    *conf.NodeConfig
 	info                    *panel.NodeInfo
@@ -52,11 +55,11 @@ func (c *Controller) Start(x *core.V2Core) error {
 		node = c.info
 	}
 	// Update user
-	c.userList, err = c.apiClient.GetUserList(context.Background())
+	users, etag, err := c.apiClient.GetUserList(context.Background(), "")
 	if err != nil {
 		return fmt.Errorf("get user list error: %s", err)
 	}
-	if len(c.userList) == 0 {
+	if len(users) == 0 {
 		return errors.New("add users error: not have any user")
 	}
 	c.aliveMap, err = c.apiClient.GetUserAlive(context.Background())
@@ -66,7 +69,7 @@ func (c *Controller) Start(x *core.V2Core) error {
 	c.tag = node.Tag
 
 	// add limiter
-	l := limiter.AddLimiter(c.info.Type, c.tag, c.userList, c.aliveMap)
+	l := limiter.AddLimiter(c.info.Type, c.tag, users, c.aliveMap)
 	c.limiter = l
 	if node.Security == panel.Tls {
 		err = c.requestCert()
@@ -81,13 +84,14 @@ func (c *Controller) Start(x *core.V2Core) error {
 	}
 	added, err := c.server.AddUsers(&core.AddUsersParams{
 		Tag:      c.tag,
-		Users:    c.userList,
+		Users:    users,
 		NodeInfo: node,
 	})
 	if err != nil {
 		return fmt.Errorf("add users error: %s", err)
 	}
 	log.WithField("tag", c.tag).Infof("Added %d new users", added)
+	c.userList, c.userListETag = users, etag
 	c.info = node
 	c.startTasks(node)
 	return nil

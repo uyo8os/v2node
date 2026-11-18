@@ -10,7 +10,6 @@ import (
 	panel "github.com/wyx2685/v2node/api/v2board"
 	"github.com/wyx2685/v2node/common/counter"
 	"github.com/wyx2685/v2node/common/format"
-	"github.com/wyx2685/v2node/core/app/dispatcher"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -42,34 +41,40 @@ func (v *V2Core) GetUserManager(tag string) (proxy.UserManager, error) {
 	return userManager, nil
 }
 
-func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) (int, error) {
 	userManager, err := vc.GetUserManager(tag)
 	if err != nil {
-		return fmt.Errorf("get user manager error: %s", err)
+		return 0, fmt.Errorf("get user manager error: %s", err)
 	}
-	var user string
-	vc.users.mapLock.Lock()
-	defer vc.users.mapLock.Unlock()
+	var deleted int
+	var closeLinks []func()
+	vc.userLock.Lock()
 	for i := range users {
-		user = format.UserTag(tag, users[i].Uuid)
+		user := format.UserTag(tag, users[i].Uuid)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = userManager.RemoveUser(ctx, user)
+		if err != nil && userManager.GetUser(ctx, user) == nil && ctx.Err() == nil {
+			// A retry may find that the protocol has already removed the user.
+			err = nil
+		}
 		cancel()
 		if err != nil {
-			return err
+			break
 		}
-		delete(vc.users.uidMap, user)
+		if closeUserLinks := vc.dispatcher.DetachUser(user, true); closeUserLinks != nil {
+			closeLinks = append(closeLinks, closeUserLinks)
+		}
 		if v, ok := vc.dispatcher.Counter.Load(tag); ok {
 			tc := v.(*counter.TrafficCounter)
 			tc.Delete(user)
 		}
-		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
-			lm := v.(*dispatcher.LinkManager)
-			lm.CloseAll()
-			vc.dispatcher.LinkManagers.Delete(user)
-		}
+		deleted++
 	}
-	return nil
+	vc.userLock.Unlock()
+	for _, closeUserLinks := range closeLinks {
+		closeUserLinks()
+	}
+	return deleted, err
 }
 
 // DisconnectUsers 强制断开一批用户当前已建立的所有连接，但不撤销其鉴权身份
@@ -79,27 +84,25 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 // 不一定生效（部分协议路径会绕过限速写入点直接操作底层 socket），必须强制
 // 断开让客户端重新连接，新连接才会重新走一遍限速判断逻辑。
 func (vc *V2Core) DisconnectUsers(users []panel.UserInfo, tag string) error {
-	var user string
-	vc.users.mapLock.Lock()
-	defer vc.users.mapLock.Unlock()
+	var closeLinks []func()
+	vc.userLock.Lock()
 	for i := range users {
-		user = format.UserTag(tag, users[i].Uuid)
-		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
-			lm := v.(*dispatcher.LinkManager)
-			lm.CloseAll()
-			// 删除旧的（已 CloseAll 标记为 closed 的）LinkManager 记录，
-			// 保证该用户下一次重新建立连接时会创建一个全新的 LinkManager，
-			// 不会被历史的 closed 状态误伤（否则新连接会被立即强制关闭）。
-			vc.dispatcher.LinkManagers.Delete(user)
+		user := format.UserTag(tag, users[i].Uuid)
+		if closeUserLinks := vc.dispatcher.DetachUser(user, false); closeUserLinks != nil {
+			closeLinks = append(closeLinks, closeUserLinks)
 		}
+	}
+	vc.userLock.Unlock()
+	for _, closeUserLinks := range closeLinks {
+		closeUserLinks()
 	}
 	return nil
 }
 
 func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
 	trafficSlice := make([]panel.UserTraffic, 0)
-	vc.users.mapLock.RLock()
-	defer vc.users.mapLock.RUnlock()
+	vc.userLock.RLock()
+	defer vc.userLock.RUnlock()
 	if v, ok := vc.dispatcher.Counter.Load(tag); ok {
 		c := v.(*counter.TrafficCounter)
 		c.Counters.Range(func(key, value interface{}) bool {
@@ -110,12 +113,13 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 			if up+down > int64(mintraffic*1000) {
 				traffic.UpCounter.Store(0)
 				traffic.DownCounter.Store(0)
-				if vc.users.uidMap[email] == 0 {
+				uid := vc.dispatcher.UserID(email)
+				if uid == 0 {
 					c.Delete(email)
 					return true
 				}
 				trafficSlice = append(trafficSlice, panel.UserTraffic{
-					UID:      vc.users.uidMap[email],
+					UID:      uid,
 					Upload:   up,
 					Download: down,
 				})
@@ -131,11 +135,8 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 }
 
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
-	v.users.mapLock.Lock()
-	defer v.users.mapLock.Unlock()
-	for i := range p.Users {
-		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
-	}
+	v.userLock.Lock()
+	defer v.userLock.Unlock()
 	var users []*protocol.User
 	switch p.NodeInfo.Type {
 	case "vmess":
@@ -162,19 +163,21 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	if err != nil {
 		return 0, fmt.Errorf("get user manager error: %s", err)
 	}
-	for _, u := range users {
+	for i, u := range users {
 		mUser, err := u.ToMemoryUser()
 		if err != nil {
-			return 0, err
+			return added, err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = man.AddUser(ctx, mUser)
 		cancel()
 		if err != nil {
-			return 0, err
+			return added, err
 		}
+		v.dispatcher.ActivateUser(mUser.Email, p.Users[i].Id)
+		added++
 	}
-	return len(users), nil
+	return added, nil
 }
 
 func buildVmessUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {

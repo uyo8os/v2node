@@ -30,25 +30,16 @@ type V2Core struct {
 	ReloadCh   chan struct{}
 	access     sync.Mutex
 	Server     *core.Instance
-	users      *UserMap
+	userLock   sync.RWMutex
 	ihm        inbound.Manager
 	ohm        outbound.Manager
 	dispatcher *dispatcher.DefaultDispatcher
 }
 
-type UserMap struct {
-	uidMap  map[string]int
-	mapLock sync.RWMutex
-}
-
 func New(config *conf.Conf) *V2Core {
-	core := &V2Core{
+	return &V2Core{
 		Config: config,
-		users: &UserMap{
-			uidMap: make(map[string]int),
-		},
 	}
-	return core
 }
 
 func (v *V2Core) Start(infos []*panel.NodeInfo) error {

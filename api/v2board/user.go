@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
-	"encoding/json/jsontext"
 	"encoding/json/v2"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -36,64 +36,42 @@ type AliveMap struct {
 	Alive map[int]int `json:"alive"`
 }
 
-// GetUserList will pull user from v2board
-func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
+// GetUserList returns a snapshot and its ETag. A nil slice indicates HTTP 304.
+func (c *Client) GetUserList(ctx context.Context, etag string) ([]UserInfo, string, error) {
 	const path = "/api/v1/server/UniProxy/user"
 	r, err := c.client.R().
 		SetContext(ctx).
-		SetHeader("If-None-Match", c.userEtag).
+		SetHeader("If-None-Match", etag).
 		SetHeader("X-Response-Format", "msgpack").
 		SetDoNotParseResponse(true).
 		Get(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if r == nil || r.RawResponse == nil {
-		return nil, fmt.Errorf("received nil response or raw response")
+		return nil, "", fmt.Errorf("received nil response or raw response")
 	}
 	defer r.RawResponse.Body.Close()
 
-	if r.StatusCode() == 304 {
-		return nil, nil
+	if r.StatusCode() == http.StatusNotModified {
+		return nil, "", nil
+	}
+	if r.StatusCode() != http.StatusOK {
+		return nil, "", fmt.Errorf("get user list: unexpected HTTP status %d", r.StatusCode())
 	}
 	userlist := &UserListBody{}
 	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
 		decoder := msgpack.NewDecoder(r.RawResponse.Body)
 		if err := decoder.Decode(userlist); err != nil {
-			return nil, fmt.Errorf("decode user list error: %w", err)
+			return nil, "", fmt.Errorf("decode user list error: %w", err)
 		}
-	} else {
-		dec := jsontext.NewDecoder(r.RawResponse.Body)
-		for {
-			tok, err := dec.ReadToken()
-			if err != nil {
-				return nil, fmt.Errorf("decode user list error: %w", err)
-			}
-			if tok.Kind() == '"' && tok.String() == "users" {
-				break
-			}
-		}
-		tok, err := dec.ReadToken()
-		if err != nil {
-			return nil, fmt.Errorf("decode user list error: %w", err)
-		}
-		if tok.Kind() != '[' {
-			return nil, fmt.Errorf(`decode user list error: expected "users" array`)
-		}
-		for dec.PeekKind() != ']' {
-			val, err := dec.ReadValue()
-			if err != nil {
-				return nil, fmt.Errorf("decode user list error: read user object: %w", err)
-			}
-			var u UserInfo
-			if err := json.Unmarshal(val, &u); err != nil {
-				return nil, fmt.Errorf("decode user list error: unmarshal user error: %w", err)
-			}
-			userlist.Users = append(userlist.Users, u)
-		}
+	} else if err := json.UnmarshalRead(r.RawResponse.Body, userlist); err != nil {
+		return nil, "", fmt.Errorf("decode user list error: %w", err)
 	}
-	c.userEtag = r.Header().Get("ETag")
-	return userlist.Users, nil
+	if userlist.Users == nil {
+		return nil, "", fmt.Errorf(`decode user list error: expected "users" array`)
+	}
+	return userlist.Users, r.Header().Get("ETag"), nil
 }
 
 // GetUserAlive will fetch the alive_ip count for users

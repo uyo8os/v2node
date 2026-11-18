@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -49,6 +50,12 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 }
 
 func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
+	// A timed-out poll can still be applying user changes when the next poll starts.
+	if !c.userSyncMu.TryLock() {
+		return nil
+	}
+	defer c.userSyncMu.Unlock()
+
 	// get node info
 	newN, err := c.apiClient.GetNodeInfo(ctx)
 	if err != nil {
@@ -77,7 +84,7 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	log.WithField("tag", c.tag).Debug("Node info no change")
 
 	// get user info
-	newU, err := c.apiClient.GetUserList(ctx)
+	newU, etag, err := c.apiClient.GetUserList(ctx, c.userListETag)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
@@ -106,15 +113,16 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		c.limiter.AliveList = newA
 	}
 	// node no changed, check users
-	if len(newU) == 0 {
+	if newU == nil {
 		log.WithField("tag", c.tag).Debug("User list no change")
 		return nil
 	}
 	deleted, added, modified := compareUserList(c.userList, newU)
 	if len(deleted) > 0 {
 		// have deleted users
-		err = c.server.DelUsers(deleted, c.tag, c.info)
+		count, err := c.server.DelUsers(deleted, c.tag, c.info)
 		if err != nil {
+			c.recordPartialUserChanges(nil, deleted[:count])
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
@@ -124,12 +132,13 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	}
 	if len(added) > 0 {
 		// have added users
-		_, err = c.server.AddUsers(&vCore.AddUsersParams{
+		count, err := c.server.AddUsers(&vCore.AddUsersParams{
 			Tag:      c.tag,
 			NodeInfo: c.info,
 			Users:    added,
 		})
 		if err != nil {
+			c.recordPartialUserChanges(added[:count], deleted)
 			log.WithFields(log.Fields{
 				"tag": c.tag,
 				"err": err,
@@ -162,7 +171,28 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		}
 	}
 
-	c.userList = newU
+	c.userList, c.userListETag = newU, etag
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil
+}
+
+func (c *Controller) recordPartialUserChanges(added, deleted []panel.UserInfo) {
+	if len(added) == 0 && len(deleted) == 0 {
+		return
+	}
+	// The local state represents neither the previous snapshot nor the new one.
+	// Force a full response even if the panel reverts to its previous snapshot.
+	c.userListETag = ""
+	c.limiter.UpdateUser(c.tag, added, deleted, nil)
+	if len(deleted) > 0 {
+		removed := make(map[string]struct{}, len(deleted))
+		for _, user := range deleted {
+			removed[user.Uuid] = struct{}{}
+		}
+		c.userList = slices.DeleteFunc(c.userList, func(user panel.UserInfo) bool {
+			_, ok := removed[user.Uuid]
+			return ok
+		})
+	}
+	c.userList = append(c.userList, added...)
 }
