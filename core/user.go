@@ -111,8 +111,11 @@ func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserT
 			up := traffic.UpCounter.Load()
 			down := traffic.DownCounter.Load()
 			if up+down > int64(mintraffic*1000) {
-				traffic.UpCounter.Store(0)
-				traffic.DownCounter.Store(0)
+				up = traffic.UpCounter.Swap(0)
+				down = traffic.DownCounter.Swap(0)
+				if up == 0 && down == 0 {
+					return true
+				}
 				uid := vc.dispatcher.UserID(email)
 				if uid == 0 {
 					c.Delete(email)

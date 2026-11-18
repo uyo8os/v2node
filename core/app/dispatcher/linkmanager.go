@@ -24,6 +24,7 @@ type trackedLink struct {
 	reader   buf.Reader
 	writer   buf.Writer
 	downlink *pipe.Reader
+	cancel   context.CancelFunc
 }
 
 func (m *userLinks) add(link *trackedLink) bool {
@@ -154,6 +155,11 @@ func (m *userLinks) retire() func() {
 	}
 	return func() {
 		closed := make(map[net.Conn]struct{})
+		for link := range links {
+			if link.cancel != nil {
+				link.cancel()
+			}
+		}
 		for link := range links {
 			if _, ok := closed[link.conn]; link.conn != nil && !ok {
 				closed[link.conn] = struct{}{}

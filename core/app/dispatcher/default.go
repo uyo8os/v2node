@@ -401,10 +401,22 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			common.Interrupt(outbound.Reader)
 			return errors.New("Limited ", user.Email, " by conn or ip")
 		}
+		canSplice := w == nil && destination.Network == net.Network_TCP &&
+			sessionInbound.Conn != nil && (sessionInbound.CanSpliceCopy == 1 || sessionInbound.CanSpliceCopy == 2) &&
+			supportsMeteredSplice(outbound.Writer)
+		var cancel context.CancelFunc
+		if canSplice {
+			content.SetAttribute("v2node:metered-splice", "true")
+			ctx, cancel = context.WithCancel(ctx)
+			defer cancel()
+		} else {
+			sessionInbound.CanSpliceCopy = 3
+		}
 		link := &trackedLink{
 			conn:   sessionInbound.Conn,
 			reader: outbound.Reader,
 			writer: outbound.Writer,
+			cancel: cancel,
 		}
 		if !manager.add(link) {
 			if link.conn != nil {
@@ -415,8 +427,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			return errors.New("Inactive connection for ", user.Email)
 		}
 		defer manager.remove(link)
-		// The splice path reports traffic at the end of the copy.
-		sessionInbound.CanSpliceCopy = 3
 		if w != nil {
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
 		}
@@ -429,7 +439,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		}
 
 		ts := t.GetCounter(user.Email)
-		downcounter := &counter.XrayTrafficCounter{V: &ts.DownCounter}
+		var downcounter stats.Counter = &counter.XrayTrafficCounter{V: &ts.DownCounter}
+		if canSplice {
+			downcounter = meteredDownlink(downcounter)
+		}
 		outbound.Reader = &CounterReader{
 			Reader:  &buf.TimeoutWrapperReader{Reader: outbound.Reader},
 			Counter: &ts.UpCounter,
